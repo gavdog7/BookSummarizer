@@ -1,6 +1,7 @@
 # Ignore folders
 BooksIn/
 BooksOut/
+Temp/
 
 # Environment variables
 .env

@@ -14,6 +14,8 @@ import math
 import time
 import argparse
 import subprocess
+import glob
+import json
 from pathlib import Path
 import anthropic
 from dotenv import load_dotenv
@@ -30,7 +32,7 @@ CLAUDE_OUTPUT_PRICE_PER_1M = 75.00  # $75 per million output tokens
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Summarize books using Claude 3.7")
-    parser.add_argument("filename", help="Path to the file to summarize")
+    parser.add_argument("filename", nargs="?", help="Path to the file to summarize")
     return parser.parse_args()
 
 def convert_epub_to_text(filename):
@@ -80,6 +82,93 @@ def estimate_reading_time(word_count):
     """Estimate reading time in hours based on words per minute."""
     minutes = word_count / WORDS_PER_MINUTE
     return minutes / 60  # Convert to hours
+
+def list_books_in_directory(directory="BooksIn"):
+    """List all text and epub files in the directory and return their reading times."""
+    # Get path to the BooksIn directory
+    books_dir = Path(directory)
+    
+    # Ensure the directory exists
+    if not books_dir.exists() or not books_dir.is_dir():
+        print(f"Error: {directory} directory not found.")
+        sys.exit(1)
+    
+    # Find all .txt and .epub files
+    book_files = []
+    for ext in ["*.txt", "*.epub"]:
+        book_files.extend(books_dir.glob(ext))
+    
+    # Sort files by size (largest first as a proxy for longest reading time)
+    book_files.sort(key=lambda x: x.stat().st_size, reverse=True)
+    
+    # No books found
+    if not book_files:
+        print(f"No books found in {directory} directory.")
+        print("Please add .txt or .epub files to this directory.")
+        sys.exit(1)
+    
+    # Process each file to get word count and reading time
+    books = []
+    for i, file_path in enumerate(book_files):
+        try:
+            # Read file contents
+            text = read_file(file_path)
+            
+            # Count words and estimate reading time
+            word_count = count_words(text)
+            reading_hours = estimate_reading_time(word_count)
+            
+            # Add to books list
+            books.append({
+                "index": i + 1,
+                "filename": file_path.name,
+                "path": str(file_path),
+                "word_count": word_count,
+                "reading_hours": reading_hours
+            })
+        except Exception as e:
+            print(f"Warning: Could not process {file_path.name}: {str(e)}")
+    
+    return books
+
+def select_book_to_summarize():
+    """Display a list of books and allow the user to select one."""
+    # Get books from directory
+    books = list_books_in_directory()
+    
+    # Display books sorted by reading time (longest first)
+    print("\nAvailable books to summarize:")
+    print("-" * 50)
+    for book in books:
+        reading_minutes = book["reading_hours"] * 60
+        print(f"{book['index']}. {book['filename']}, Time to read: {book['reading_hours']:.1f} hours ({reading_minutes:.0f} minutes)")
+    print("-" * 50)
+    
+    # Ask user to select a book
+    while True:
+        try:
+            selection = input("\nWhich book would you like to summarize? (enter number 1-" + str(len(books)) + "): ")
+            
+            # Check if input is a number
+            if not selection.isdigit():
+                print("Please enter a number.")
+                continue
+                
+            book_index = int(selection)
+            
+            # Check if the number is in the valid range
+            if book_index < 1 or book_index > len(books):
+                print(f"Please enter a number between 1 and {len(books)}.")
+                continue
+                
+            # Return the selected book path
+            selected_book = books[book_index - 1]
+            print(f"\nSelected: {selected_book['filename']}")
+            return selected_book["path"]
+            
+        except ValueError:
+            print("Please enter a valid number.")
+            continue
 
 def calculate_output_tokens(hours):
     """Calculate output tokens based on desired reading time."""
@@ -273,127 +362,268 @@ def show_progress(part, num_parts, start_time=None):
         print(f"  Part {part}/{num_parts} completed in {elapsed:.2f} seconds.")
     else:
         print(f"  Processing part {part}/{num_parts}...")
+        
+def save_to_temp_file(filename, part_num, num_parts, summaries, desired_output_tokens):
+    """Save progress to a temporary file for potential recovery."""
+    temp_dir = Path("Temp")
+    temp_dir.mkdir(exist_ok=True)
+    
+    # Create a unique temp file name based on the original file
+    file_base = Path(filename).stem
+    temp_file = temp_dir / f"{file_base}_temp.json"
+    
+    # Prepare data to save
+    temp_data = {
+        "filename": filename,
+        "part_num": part_num,
+        "num_parts": num_parts,
+        "summaries": summaries,
+        "desired_output_tokens": desired_output_tokens,
+        "timestamp": time.time()
+    }
+    
+    # Save to file
+    with open(temp_file, 'w', encoding='utf-8') as f:
+        json.dump(temp_data, f, indent=2)
+        
+    return temp_file
+
+def check_for_resumable_jobs():
+    """Check for resumable summarization jobs in the Temp directory."""
+    temp_dir = Path("Temp")
+    
+    # If Temp directory doesn't exist, no resumable jobs
+    if not temp_dir.exists() or not temp_dir.is_dir():
+        return None
+        
+    # Find all JSON files in Temp
+    temp_files = list(temp_dir.glob("*_temp.json"))
+    
+    if not temp_files:
+        return None
+        
+    # Sort by modification time (newest first)
+    temp_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    
+    # Return the most recent temp file
+    most_recent = temp_files[0]
+    
+    try:
+        with open(most_recent, 'r', encoding='utf-8') as f:
+            temp_data = json.load(f)
+            
+        # Check if the referenced file still exists
+        if not Path(temp_data["filename"]).exists():
+            print(f"Warning: Original file {temp_data['filename']} not found.")
+            return None
+            
+        return temp_data
+        
+    except Exception as e:
+        print(f"Warning: Could not read temp file {most_recent}: {str(e)}")
+        return None
+
+def cleanup_temp_files(filename):
+    """Clean up temporary files after successful completion."""
+    temp_dir = Path("Temp")
+    
+    if not temp_dir.exists() or not temp_dir.is_dir():
+        return
+        
+    # Get the file base name
+    file_base = Path(filename).stem
+    
+    # Find matching temp files
+    temp_files = list(temp_dir.glob(f"{file_base}_temp*"))
+    
+    # Delete all matching temp files
+    for temp_file in temp_files:
+        try:
+            temp_file.unlink()
+        except Exception as e:
+            print(f"Warning: Could not delete temp file {temp_file}: {str(e)}")
 
 def main():
     args = parse_arguments()
     
     print(f"\n===== Book Summarization Tool =====\n")
     
-    # Read file
-    print(f"Reading file: {args.filename}")
-    text = read_file(args.filename)
-    
-    # Count words and estimate tokens
-    word_count = count_words(text)
-    token_count = estimate_tokens(word_count)
-    reading_hours = estimate_reading_time(word_count)
-    
-    print(f"Total words: {word_count:,}")
-    print(f"Estimated tokens: {token_count:,}")
-    print(f"Estimated full reading time: {reading_hours:.2f} hours ({reading_hours * 60:.0f} minutes)")
-    
-    # Ask user for desired reading time
-    while True:
-        try:
-            desired_hours = float(input("\nHow many hours would you like to spend reading the summary? "))
-            if desired_hours <= 0:
-                print("Please enter a positive number.")
-                continue
-            
-            # Check if user wants to expand the file (make summary longer than original)
-            if desired_hours > reading_hours:
-                print("\nWARNING: You're attempting to create a summary that would take longer")
-                print(f"to read ({desired_hours:.2f} hours) than the original document ({reading_hours:.2f} hours).")
-                print("This is experimental and may not produce good results.")
+    # Check for resumable jobs
+    resumable_job = check_for_resumable_jobs()
+    if resumable_job:
+        # Ask if user wants to resume
+        book_name = Path(resumable_job["filename"]).name
+        part_completed = resumable_job["part_num"]
+        total_parts = resumable_job["num_parts"]
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(resumable_job["timestamp"]))
+        
+        print(f"Found a resumable job from {timestamp}:")
+        print(f"Book: {book_name}")
+        print(f"Progress: {part_completed}/{total_parts} parts completed")
+        
+        while True:
+            resume_choice = input("\nWould you like to resume this job? (y/n): ").lower()
+            if resume_choice in ['y', 'yes']:
+                # Set up variables from the saved job
+                filename = resumable_job["filename"]
+                start_part = resumable_job["part_num"] + 1
+                num_parts = resumable_job["num_parts"]
+                summaries = resumable_job["summaries"]
+                desired_output_tokens = resumable_job["desired_output_tokens"]
                 
-                while True:
-                    expand_choice = input("Are you sure you want to proceed? (y/n): ").lower()
-                    if expand_choice in ['y', 'yes']:
-                        break
-                    elif expand_choice in ['n', 'no']:
-                        print("Please enter a shorter reading time.")
-                        break
-                    else:
-                        print("Please enter 'y' or 'n'.")
+                # Read the file
+                text = read_file(filename)
                 
-                if expand_choice in ['n', 'no']:
-                    continue  # Go back to entering reading time
-            
-            break
-        except ValueError:
-            print("Please enter a valid number.")
-    
-    # Calculate desired output tokens
-    desired_output_tokens = calculate_output_tokens(desired_hours)
-    print(f"For a {desired_hours:.2f} hour summary, we'll target approximately {desired_output_tokens:,} tokens.")
-    
-    # Determine split strategy
-    num_parts = determine_split_strategy(token_count, desired_output_tokens)
-    
-    # Present approach
-    if num_parts == 1:
-        print("\nThis summarization task fits within Claude 3.7's context window. No need to split the file.")
+                # Recalculate some variables
+                word_count = count_words(text)
+                token_count = estimate_tokens(word_count)
+                
+                # Split text
+                parts = split_text(text, num_parts)
+                
+                # Skip to API setup
+                resume_mode = True
+                break
+            elif resume_choice in ['n', 'no']:
+                # Start a new job
+                resume_mode = False
+                break
+            else:
+                print("Please enter 'y' or 'n'.")
     else:
-        print(f"\nTo summarize this book, I'll need to split this file into {num_parts} parts")
-        print(f"so it can be summarized by Claude 3.7. I'll include a 5% overlap in each part")
-        print(f"for cohesiveness of the summary.")
+        resume_mode = False
     
-    # Ask user to proceed or modify
-    while True:
-        choice = input("Proceed? (yes/no/modify): ").lower()
+    # Normal startup if not resuming
+    if not resume_mode:
+        # Determine file to summarize
+        filename = args.filename
+        if not filename:
+            # If no file provided via command line, ask the user to select from BooksIn
+            filename = select_book_to_summarize()
         
-        if choice in ["yes", "y"]:
-            break
-        elif choice in ["no", "n"]:
-            print("Exiting.")
-            sys.exit(0)
-        elif choice in ["modify", "m"]:
-            # Allow user to modify parameters
-            while True:
-                try:
-                    num_parts = int(input(f"Enter new number of parts (current: {num_parts}): "))
-                    if num_parts <= 0:
-                        print("Please enter a positive number.")
-                        continue
-                    break
-                except ValueError:
-                    print("Please enter a valid number.")
-            
-            while True:
-                try:
-                    overlap_percentage = float(input("Enter new overlap percentage (current: 5): "))
-                    if overlap_percentage < 0 or overlap_percentage > 50:
-                        print("Please enter a number between 0 and 50.")
-                        continue
-                    break
-                except ValueError:
-                    print("Please enter a valid number.")
-            
-            print(f"\nUpdated approach: Split into {num_parts} parts with {overlap_percentage}% overlap.")
-            break
-        else:
-            print("Please enter 'yes', 'no', or 'modify'.")
-    
-    # Estimate cost
-    cost_per_part, total_cost = estimate_cost(num_parts, token_count, desired_output_tokens)
-    
-    print(f"\nCost estimate:")
-    print(f"{num_parts} parts with approximately {token_count//num_parts:,} input tokens")
-    print(f"and {desired_output_tokens//num_parts:,} output tokens per part")
-    print(f"will cost approximately ${cost_per_part:.2f} each.")
-    print(f"Total estimated cost: ${total_cost:.2f}")
-    
-    # Ask user to proceed
-    while True:
-        choice = input("Would you like to proceed? (yes/no): ").lower()
+        # Read file
+        print(f"Reading file: {filename}")
+        text = read_file(filename)
         
-        if choice in ["yes", "y"]:
-            break
-        elif choice in ["no", "n"]:
-            print("Exiting.")
-            sys.exit(0)
+        # Count words and estimate tokens
+        word_count = count_words(text)
+        token_count = estimate_tokens(word_count)
+        reading_hours = estimate_reading_time(word_count)
+        
+        print(f"Total words: {word_count:,}")
+        print(f"Estimated tokens: {token_count:,}")
+        print(f"Estimated full reading time: {reading_hours:.2f} hours ({reading_hours * 60:.0f} minutes)")
+        
+        # Ask user for desired reading time
+        while True:
+            try:
+                desired_hours = float(input("\nHow many hours would you like to spend reading the summary? "))
+                if desired_hours <= 0:
+                    print("Please enter a positive number.")
+                    continue
+                
+                # Check if user wants to expand the file (make summary longer than original)
+                if desired_hours > reading_hours:
+                    print("\nWARNING: You're attempting to create a summary that would take longer")
+                    print(f"to read ({desired_hours:.2f} hours) than the original document ({reading_hours:.2f} hours).")
+                    print("This is experimental and may not produce good results.")
+                    
+                    while True:
+                        expand_choice = input("Are you sure you want to proceed? (y/n): ").lower()
+                        if expand_choice in ['y', 'yes']:
+                            break
+                        elif expand_choice in ['n', 'no']:
+                            print("Please enter a shorter reading time.")
+                            break
+                        else:
+                            print("Please enter 'y' or 'n'.")
+                    
+                    if expand_choice in ['n', 'no']:
+                        continue  # Go back to entering reading time
+                
+                break
+            except ValueError:
+                print("Please enter a valid number.")
+        
+        # Calculate desired output tokens
+        desired_output_tokens = calculate_output_tokens(desired_hours)
+        print(f"For a {desired_hours:.2f} hour summary, we'll target approximately {desired_output_tokens:,} tokens.")
+        
+        # Determine split strategy
+        num_parts = determine_split_strategy(token_count, desired_output_tokens)
+        
+        # Present approach
+        if num_parts == 1:
+            print("\nThis summarization task fits within Claude 3.7's context window. No need to split the file.")
         else:
-            print("Please enter 'yes' or 'no'.")
+            print(f"\nTo summarize this book, I'll need to split this file into {num_parts} parts")
+            print(f"so it can be summarized by Claude 3.7. I'll include a 5% overlap in each part")
+            print(f"for cohesiveness of the summary.")
+        
+        # Ask user to proceed or modify
+        while True:
+            choice = input("Proceed? (yes/no/modify): ").lower()
+            
+            if choice in ["yes", "y"]:
+                break
+            elif choice in ["no", "n"]:
+                print("Exiting.")
+                sys.exit(0)
+            elif choice in ["modify", "m"]:
+                # Allow user to modify parameters
+                while True:
+                    try:
+                        num_parts = int(input(f"Enter new number of parts (current: {num_parts}): "))
+                        if num_parts <= 0:
+                            print("Please enter a positive number.")
+                            continue
+                        break
+                    except ValueError:
+                        print("Please enter a valid number.")
+                
+                overlap_percentage = 5  # Default
+                while True:
+                    try:
+                        overlap_percentage = float(input("Enter new overlap percentage (current: 5): "))
+                        if overlap_percentage < 0 or overlap_percentage > 50:
+                            print("Please enter a number between 0 and 50.")
+                            continue
+                        break
+                    except ValueError:
+                        print("Please enter a valid number.")
+                
+                print(f"\nUpdated approach: Split into {num_parts} parts with {overlap_percentage}% overlap.")
+                break
+            else:
+                print("Please enter 'yes', 'no', or 'modify'.")
+        
+        # Estimate cost
+        cost_per_part, total_cost = estimate_cost(num_parts, token_count, desired_output_tokens)
+        
+        print(f"\nCost estimate:")
+        print(f"{num_parts} parts with approximately {token_count//num_parts:,} input tokens")
+        print(f"and {desired_output_tokens//num_parts:,} output tokens per part")
+        print(f"will cost approximately ${cost_per_part:.2f} each.")
+        print(f"Total estimated cost: ${total_cost:.2f}")
+        
+        # Ask user to proceed
+        while True:
+            choice = input("Would you like to proceed? (yes/no): ").lower()
+            
+            if choice in ["yes", "y"]:
+                break
+            elif choice in ["no", "n"]:
+                print("Exiting.")
+                sys.exit(0)
+            else:
+                print("Please enter 'yes' or 'no'.")
+        
+        # Initialize empty summaries list and starting part
+        summaries = []
+        start_part = 1
+        
+        # Split text
+        parts = split_text(text, num_parts)
     
     # Check for API key in .env file first
     load_dotenv()
@@ -441,15 +671,12 @@ def main():
         print("\nPlease check your API key and try again.")
         sys.exit(1)
     
-    # Split text
-    parts = split_text(text, num_parts)
-    
     # Process each part
-    summaries = []
     print("\nSummarizing text...")
     
-    for i, part in enumerate(parts):
+    for i in range(start_part - 1, num_parts):
         part_num = i + 1
+        part = parts[i]
         show_progress(part_num, num_parts)
         
         # Format prompt
@@ -470,6 +697,9 @@ def main():
             # Add to summaries
             summaries.append(summary)
             
+            # Save progress to temp file
+            temp_file = save_to_temp_file(filename, part_num, num_parts, summaries, desired_output_tokens)
+            
             # Show progress
             show_progress(part_num, num_parts, start_time)
             
@@ -481,36 +711,62 @@ def main():
                 print(f"  Estimated time remaining: {int(m)} minutes {int(s)} seconds")
                 
         except KeyboardInterrupt:
-            print("\nOperation canceled by user.")
+            print("\nOperation interrupted. Progress saved to temporary file.")
+            print(f"You can resume this job later by running the script again.")
             sys.exit(0)
         except Exception as e:
             print(f"\nError: {str(e)}")
+            print("\nProgress saved to temporary file.")
+            print(f"You can resume this job later by running the script again.")
             sys.exit(1)
     
     # Combine summaries
     combined_summary = "\n\n".join(summaries)
     
     # Save results
-    file_base = Path(args.filename).stem
-    txt_output = f"{file_base}_summary.txt"
+    file_base = Path(filename).stem
+    
+    # Create BooksOut directory if it doesn't exist
+    booksout_dir = Path("BooksOut")
+    booksout_dir.mkdir(exist_ok=True)
+    
+    # Prepare file paths
+    txt_output = booksout_dir / f"{file_base}_summary.txt"
     
     # Save text file
     with open(txt_output, 'w', encoding='utf-8') as f:
         f.write(combined_summary)
+    
+    # Move the original file to BooksOut (if it's not already there)
+    original_file = Path(filename)
+    destination_file = booksout_dir / original_file.name
+    
+    # Only move the file if it's not already in BooksOut
+    if str(original_file.parent) != str(booksout_dir):
+        try:
+            # Copy the original file rather than move it (safer)
+            with open(original_file, 'rb') as src, open(destination_file, 'wb') as dst:
+                dst.write(src.read())
+            print(f"Original file copied to: {destination_file}")
+        except Exception as e:
+            print(f"Warning: Could not copy original file: {str(e)}")
     
     print(f"\nSummarization complete!")
     print(f"Summary saved as: {txt_output}")
     
     # Optionally create EPUB if pandoc is available
     try:
-        epub_output = f"{file_base}_summary.epub"
+        epub_output = booksout_dir / f"{file_base}_summary.epub"
         subprocess.run(
-            ["pandoc", txt_output, "-o", epub_output, "--metadata", f"title=Summary of {file_base}"],
+            ["pandoc", str(txt_output), "-o", str(epub_output), "--metadata", f"title=Summary of {file_base}"],
             check=True, capture_output=True
         )
         print(f"EPUB version saved as: {epub_output}")
     except (subprocess.CalledProcessError, FileNotFoundError):
         print("Note: EPUB creation skipped (requires pandoc to be installed)")
+        
+    # Clean up temp files
+    cleanup_temp_files(filename)
 
 if __name__ == "__main__":
     main()
