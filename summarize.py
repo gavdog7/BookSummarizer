@@ -16,6 +16,7 @@ import argparse
 import subprocess
 from pathlib import Path
 import anthropic
+from dotenv import load_dotenv
 
 # Constants
 WORDS_PER_MINUTE = 240
@@ -394,8 +395,13 @@ def main():
         else:
             print("Please enter 'yes' or 'no'.")
     
-    # Get API key and verify it
-    api_key = input("\nPlease enter your Anthropic API key: ")
+    # Check for API key in .env file first
+    load_dotenv()
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    
+    # If API key not found in environment, ask user for it
+    if not api_key:
+        api_key = input("\nPlease enter your Anthropic API key: ")
     
     # Basic validation of API key format
     if not api_key.startswith("sk-ant-"):

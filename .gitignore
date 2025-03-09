@@ -1,0 +1,9 @@
+# Ignore folders
+BooksIn/
+BooksOut/
+
+# Environment variables
+.env
+
+# OS files
+.DS_Store
