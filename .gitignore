@@ -1,7 +1,10 @@
-# Ignore folders
-BooksIn/
-BooksOut/
-Temp/
+# Ignore contents of folders but keep folders themselves
+BooksIn/*
+!BooksIn/.gitkeep
+BooksOut/*
+!BooksOut/.gitkeep
+Temp/*
+!Temp/.gitkeep
 
 # Environment variables
 .env

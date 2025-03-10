@@ -20,6 +20,18 @@ from pathlib import Path
 import anthropic
 from dotenv import load_dotenv
 
+# Optional rich formatting
+RICH_FORMATTING = False
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn
+    RICH_FORMATTING = True
+except ImportError:
+    # Rich is not available, we'll use standard formatting
+    pass
+
 # Constants
 WORDS_PER_MINUTE = 240
 WORD_TO_TOKEN_RATIO = 1.3  # Simple multiplier for estimating tokens from words
@@ -74,9 +86,89 @@ def count_words(text):
     """Count the number of words in the text."""
     return len(text.split())
 
-def estimate_tokens(word_count):
-    """Estimate the number of tokens using a simple word multiplier."""
-    return int(word_count * WORD_TO_TOKEN_RATIO)
+def estimate_tokens(word_count, text=None, client=None):
+    """
+    Smart token estimation that uses a combination of approaches:
+    1. Start with a rough estimation based on word count
+    2. For large texts, sample a portion to get an accurate token ratio from API
+    3. Scale up the token estimate based on the sample
+    4. Fall back to simple word multiplier if API call fails
+    """
+    # Always start with a rough estimation as baseline
+    rough_token_estimate = int(word_count * WORD_TO_TOKEN_RATIO)
+    
+    # If no text or client provided, just return the rough estimate
+    if text is None or client is None:
+        return rough_token_estimate
+    
+    try:
+        # For small texts (under ~100K tokens), just use the API directly
+        if rough_token_estimate < 100000:
+            print("Text is small enough for direct token counting...")
+            response = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=1,
+                messages=[{"role": "user", "content": text}]
+            )
+            return response.usage.input_tokens
+        
+        # For larger texts, use a sampling approach
+        print("Text is large, using sampling approach for token estimation...")
+        
+        # Calculate how much text to sample (aim for around 50K tokens sample size)
+        target_sample_size = 50000
+        sample_ratio = min(1.0, target_sample_size / rough_token_estimate)
+        
+        # Get a representative sample of the text
+        words = text.split()
+        sample_word_count = int(len(words) * sample_ratio)
+        
+        # Take sample from different parts of the text for better representation
+        samples = []
+        
+        # Beginning sample (40%)
+        begin_size = int(sample_word_count * 0.4)
+        samples.append(" ".join(words[:begin_size]))
+        
+        # Middle sample (30%)
+        mid_start = len(words) // 2 - int(sample_word_count * 0.15)
+        mid_end = mid_start + int(sample_word_count * 0.3)
+        samples.append(" ".join(words[mid_start:mid_end]))
+        
+        # End sample (30%)
+        end_size = int(sample_word_count * 0.3)
+        samples.append(" ".join(words[-end_size:]))
+        
+        # Join samples with markers
+        sampled_text = "\n\n[...]\n\n".join(samples)
+        
+        # Count words in the sample
+        sample_word_count = len(sampled_text.split())
+        
+        # Get token count from API for the sample
+        print("Counting tokens in the sample...")
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1,
+            messages=[{"role": "user", "content": sampled_text}]
+        )
+        sample_token_count = response.usage.input_tokens
+        
+        # Calculate token-to-word ratio from the sample
+        token_word_ratio = sample_token_count / sample_word_count
+        
+        # Apply this ratio to the full text
+        estimated_tokens = int(word_count * token_word_ratio)
+        
+        print(f"Sample token-to-word ratio: {token_word_ratio:.3f}")
+        print(f"Estimated tokens based on sample: {estimated_tokens:,}")
+        
+        return estimated_tokens
+        
+    except Exception as e:
+        print(f"Warning: Could not use Anthropic's tokenizer: {str(e)}")
+        print("Falling back to simple estimation method.")
+        return rough_token_estimate
 
 def estimate_reading_time(word_count):
     """Estimate reading time in hours based on words per minute."""
@@ -131,6 +223,13 @@ def list_books_in_directory(directory="BooksIn"):
     
     return books
 
+def check_for_exit(input_text):
+    """Check if the user wants to exit the program."""
+    if input_text.lower() in ["exit", "quit", "q"]:
+        print("\nExiting program.")
+        sys.exit(0)
+    return input_text
+
 def select_book_to_summarize():
     """Display a list of books and allow the user to select one."""
     # Get books from directory
@@ -140,14 +239,26 @@ def select_book_to_summarize():
     print("\nAvailable books to summarize:")
     print("-" * 50)
     for book in books:
-        reading_minutes = book["reading_hours"] * 60
-        print(f"{book['index']}. {book['filename']}, Time to read: {book['reading_hours']:.1f} hours ({reading_minutes:.0f} minutes)")
+        # Format reading time more concisely
+        if book["reading_hours"] < 1:
+            # Convert to minutes for very short books
+            reading_minutes = book["reading_hours"] * 60
+            reading_time = f"~{reading_minutes:.0f}m to read"
+        else:
+            # Use hours for longer books, with 1 decimal point
+            reading_time = f"~{book['reading_hours']:.1f}h to read"
+        
+        print(f"{book['index']}. {book['filename']}, {reading_time}")
     print("-" * 50)
+    print("Type 'exit' at any prompt to quit the program.")
     
     # Ask user to select a book
     while True:
         try:
             selection = input("\nWhich book would you like to summarize? (enter number 1-" + str(len(books)) + "): ")
+            
+            # Check for exit command
+            check_for_exit(selection)
             
             # Check if input is a number
             if not selection.isdigit():
@@ -178,9 +289,14 @@ def calculate_output_tokens(hours):
     return int(words * WORD_TO_TOKEN_RATIO)
 
 def determine_split_strategy(input_tokens, desired_output_tokens):
-    """Determine if and how to split the file."""
+    """
+    Determine if and how to split the file.
+    
+    Returns a tuple of (num_parts, limiting_factor) where limiting_factor 
+    is a string indicating whether input or output tokens are the limiting factor.
+    """
     if input_tokens <= CLAUDE_MAX_INPUT_TOKENS and desired_output_tokens <= CLAUDE_MAX_OUTPUT_TOKENS:
-        return 1  # No need to split
+        return 1, "none"  # No need to split
     
     # Calculate parts based on input tokens
     parts_by_input = math.ceil(input_tokens / CLAUDE_MAX_INPUT_TOKENS)
@@ -188,8 +304,11 @@ def determine_split_strategy(input_tokens, desired_output_tokens):
     # Calculate parts based on output tokens
     parts_by_output = math.ceil(desired_output_tokens / CLAUDE_MAX_OUTPUT_TOKENS)
     
-    # Use the maximum of the two
-    return max(parts_by_input, parts_by_output)
+    # Determine the limiting factor
+    if parts_by_input >= parts_by_output:
+        return parts_by_input, "input"
+    else:
+        return parts_by_output, "output"
 
 def split_text(text, num_parts, overlap_percentage=5):
     """Split text into parts with overlap."""
@@ -363,30 +482,125 @@ def show_progress(part, num_parts, start_time=None):
     else:
         print(f"  Processing part {part}/{num_parts}...")
         
+def save_text_parts_to_temp(filename, parts):
+    """Save split text parts to the Temp folder for recovery if needed."""
+    try:
+        temp_dir = Path("Temp")
+        temp_dir.mkdir(exist_ok=True, mode=0o777)  # Create with full permissions if it doesn't exist
+        
+        # Try to set permissions if directory already exists
+        try:
+            os.chmod(temp_dir, 0o777)
+        except Exception as e:
+            print(f"Warning: Could not set permissions on Temp directory: {str(e)}")
+            print("Will attempt to continue anyway...")
+        
+        # Create a base filename
+        file_base = Path(filename).stem
+        
+        # Save each part to a separate file
+        saved_files = []
+        for i, part in enumerate(parts):
+            part_num = i + 1
+            part_file = temp_dir / f"{file_base}_part_{part_num}.txt"
+            
+            try:
+                with open(part_file, 'w', encoding='utf-8') as f:
+                    f.write(part["text"])
+                    
+                # Try to set permissions on the file
+                try:
+                    os.chmod(part_file, 0o666)  # rw-rw-rw-
+                except:
+                    pass  # Ignore if we can't set permissions
+                    
+                saved_files.append(str(part_file))
+            except PermissionError:
+                print(f"Warning: Permission denied when writing to {part_file}")
+                print("Will continue without saving this part to temp storage.")
+            except Exception as e:
+                print(f"Warning: Could not save part {part_num} to temp file: {str(e)}")
+        
+        # Only save manifest if we successfully saved at least one part
+        if saved_files:
+            # Also save a manifest file with metadata
+            manifest_file = temp_dir / f"{file_base}_parts_manifest.json"
+            manifest_data = {
+                "original_file": filename,
+                "num_parts": len(parts),
+                "part_files": saved_files,
+                "timestamp": time.time()
+            }
+            
+            try:
+                with open(manifest_file, 'w', encoding='utf-8') as f:
+                    json.dump(manifest_data, f, indent=2)
+                    
+                # Try to set permissions on the manifest file
+                try:
+                    os.chmod(manifest_file, 0o666)  # rw-rw-rw-
+                except:
+                    pass  # Ignore if we can't set permissions
+                    
+                print(f"Split text parts saved to Temp folder")
+            except Exception as e:
+                print(f"Warning: Could not save manifest file: {str(e)}")
+        else:
+            print("Warning: No parts could be saved to temp storage.")
+            print("If the process is interrupted, you may not be able to resume.")
+            
+        return saved_files
+    except Exception as e:
+        print(f"Warning: Error saving to temp files: {str(e)}")
+        print("Will continue without temp storage (no resume capability if interrupted).")
+        return []
+
 def save_to_temp_file(filename, part_num, num_parts, summaries, desired_output_tokens):
     """Save progress to a temporary file for potential recovery."""
-    temp_dir = Path("Temp")
-    temp_dir.mkdir(exist_ok=True)
-    
-    # Create a unique temp file name based on the original file
-    file_base = Path(filename).stem
-    temp_file = temp_dir / f"{file_base}_temp.json"
-    
-    # Prepare data to save
-    temp_data = {
-        "filename": filename,
-        "part_num": part_num,
-        "num_parts": num_parts,
-        "summaries": summaries,
-        "desired_output_tokens": desired_output_tokens,
-        "timestamp": time.time()
-    }
-    
-    # Save to file
-    with open(temp_file, 'w', encoding='utf-8') as f:
-        json.dump(temp_data, f, indent=2)
+    try:
+        temp_dir = Path("Temp")
+        temp_dir.mkdir(exist_ok=True, mode=0o777)  # Create with full permissions if it doesn't exist
         
-    return temp_file
+        # Try to set permissions if directory already exists
+        try:
+            os.chmod(temp_dir, 0o777)
+        except Exception as e:
+            print(f"Warning: Could not set permissions on Temp directory: {str(e)}")
+            print("Will attempt to continue anyway...")
+        
+        # Create a unique temp file name based on the original file
+        file_base = Path(filename).stem
+        temp_file = temp_dir / f"{file_base}_temp.json"
+        
+        # Prepare data to save
+        temp_data = {
+            "filename": filename,
+            "part_num": part_num,
+            "num_parts": num_parts,
+            "summaries": summaries,
+            "desired_output_tokens": desired_output_tokens,
+            "timestamp": time.time()
+        }
+        
+        # Save to file
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(temp_data, f, indent=2)
+        
+        # Try to set permissions on the file
+        try:
+            os.chmod(temp_file, 0o666)  # rw-rw-rw-
+        except:
+            pass  # Ignore if we can't set permissions
+            
+        return temp_file
+    except PermissionError:
+        print(f"Warning: Permission denied when saving progress to temp file.")
+        print("If the process is interrupted, you may not be able to resume.")
+        return None
+    except Exception as e:
+        print(f"Warning: Could not save progress to temp file: {str(e)}")
+        print("If the process is interrupted, you may not be able to resume.")
+        return None
 
 def check_for_resumable_jobs():
     """Check for resumable summarization jobs in the Temp directory."""
@@ -433,10 +647,16 @@ def cleanup_temp_files(filename):
     # Get the file base name
     file_base = Path(filename).stem
     
-    # Find matching temp files
-    temp_files = list(temp_dir.glob(f"{file_base}_temp*"))
+    # Find all matching temp files
+    temp_files = []
+    temp_files.extend(temp_dir.glob(f"{file_base}_temp*"))
+    temp_files.extend(temp_dir.glob(f"{file_base}_part_*"))
+    temp_files.extend(temp_dir.glob(f"{file_base}_parts_manifest*"))
     
     # Delete all matching temp files
+    if temp_files:
+        print(f"Cleaning up {len(temp_files)} temporary files...")
+    
     for temp_file in temp_files:
         try:
             temp_file.unlink()
@@ -447,6 +667,54 @@ def main():
     args = parse_arguments()
     
     print(f"\n===== Book Summarization Tool =====\n")
+    
+    # Check for API key in .env file first
+    load_dotenv()
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    
+    # If API key not found in environment, ask user for it
+    if not api_key:
+        user_input = input("\nPlease enter your Anthropic API key (or type 'exit' to quit): ")
+        api_key = check_for_exit(user_input)
+    
+    # Basic validation of API key format
+    if not api_key.startswith("sk-ant-"):
+        print("\nWarning: The API key doesn't follow the expected format (should start with 'sk-ant-').")
+        print("This may cause authentication issues.")
+        
+        while True:
+            user_input = input("Do you still want to continue? (y/n): ").lower()
+            continue_choice = check_for_exit(user_input)
+            if continue_choice in ['y', 'yes']:
+                break
+            elif continue_choice in ['n', 'no']:
+                print("Exiting.")
+                sys.exit(0)
+            else:
+                print("Please enter 'y' or 'n'.")
+    
+    # Initialize client with proper API key
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        
+        # Test the API connection with a minimal request
+        print("\nVerifying API connection...")
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=10,
+            messages=[
+                {"role": "user", "content": "Say 'API connection successful' and nothing else."}
+            ]
+        )
+        print(f"API connection verified: {response.content[0].text.strip()}")
+    except Exception as e:
+        print(f"\nError connecting to Claude API: {str(e)}")
+        print("\nPossible issues:")
+        print("1. The API key may be invalid")
+        print("2. You may not have access to the specified model")
+        print("3. There may be network connectivity issues")
+        print("\nPlease check your API key and try again.")
+        sys.exit(1)
     
     # Check for resumable jobs
     resumable_job = check_for_resumable_jobs()
@@ -462,7 +730,8 @@ def main():
         print(f"Progress: {part_completed}/{total_parts} parts completed")
         
         while True:
-            resume_choice = input("\nWould you like to resume this job? (y/n): ").lower()
+            user_input = input("\nWould you like to resume this job? (y/n): ").lower()
+            resume_choice = check_for_exit(user_input)
             if resume_choice in ['y', 'yes']:
                 # Set up variables from the saved job
                 filename = resumable_job["filename"]
@@ -476,12 +745,15 @@ def main():
                 
                 # Recalculate some variables
                 word_count = count_words(text)
-                token_count = estimate_tokens(word_count)
+                token_count = estimate_tokens(word_count, text, client)
                 
                 # Split text
                 parts = split_text(text, num_parts)
                 
-                # Skip to API setup
+                # Save parts to Temp folder (for consistency)
+                save_text_parts_to_temp(filename, parts)
+                
+                # Skip to output setup
                 resume_mode = True
                 break
             elif resume_choice in ['n', 'no']:
@@ -507,29 +779,53 @@ def main():
         
         # Count words and estimate tokens
         word_count = count_words(text)
-        token_count = estimate_tokens(word_count)
+        print("Counting tokens using Anthropic's tokenizer...")
+        token_count = estimate_tokens(word_count, text, client)
         reading_hours = estimate_reading_time(word_count)
         
+        # Format reading time more concisely
+        if reading_hours < 1:
+            # Convert to minutes for very short documents
+            reading_minutes = reading_hours * 60
+            reading_time = f"~{reading_minutes:.0f}m"
+        else:
+            # Use hours for longer documents, with 1 decimal point
+            reading_time = f"~{reading_hours:.1f}h"
+            
         print(f"Total words: {word_count:,}")
         print(f"Estimated tokens: {token_count:,}")
-        print(f"Estimated full reading time: {reading_hours:.2f} hours ({reading_hours * 60:.0f} minutes)")
+        print(f"Estimated reading time: {reading_time}")
         
         # Ask user for desired reading time
         while True:
             try:
-                desired_hours = float(input("\nHow many hours would you like to spend reading the summary? "))
+                user_input = input("\nHow many hours would you like to spend reading the summary? (or type 'exit' to quit): ")
+                check_for_exit(user_input)
+                desired_hours = float(user_input)
                 if desired_hours <= 0:
                     print("Please enter a positive number.")
                     continue
                 
                 # Check if user wants to expand the file (make summary longer than original)
                 if desired_hours > reading_hours:
+                    # Format the times consistently
+                    if reading_hours < 1:
+                        original_time = f"{reading_hours * 60:.0f}m"
+                    else:
+                        original_time = f"{reading_hours:.1f}h"
+                        
+                    if desired_hours < 1:
+                        summary_time = f"{desired_hours * 60:.0f}m"
+                    else:
+                        summary_time = f"{desired_hours:.1f}h"
+                        
                     print("\nWARNING: You're attempting to create a summary that would take longer")
-                    print(f"to read ({desired_hours:.2f} hours) than the original document ({reading_hours:.2f} hours).")
+                    print(f"to read (~{summary_time}) than the original document (~{original_time}).")
                     print("This is experimental and may not produce good results.")
                     
                     while True:
-                        expand_choice = input("Are you sure you want to proceed? (y/n): ").lower()
+                        user_input = input("Are you sure you want to proceed? (y/n): ").lower()
+                        expand_choice = check_for_exit(user_input)
                         if expand_choice in ['y', 'yes']:
                             break
                         elif expand_choice in ['n', 'no']:
@@ -547,22 +843,38 @@ def main():
         
         # Calculate desired output tokens
         desired_output_tokens = calculate_output_tokens(desired_hours)
-        print(f"For a {desired_hours:.2f} hour summary, we'll target approximately {desired_output_tokens:,} tokens.")
+        
+        # Format summary time consistently
+        if desired_hours < 1:
+            summary_time = f"{desired_hours * 60:.0f}m"
+        else:
+            summary_time = f"{desired_hours:.1f}h"
+            
+        print(f"For a ~{summary_time} summary, we'll target approximately {desired_output_tokens:,} tokens.")
         
         # Determine split strategy
-        num_parts = determine_split_strategy(token_count, desired_output_tokens)
+        num_parts, limiting_factor = determine_split_strategy(token_count, desired_output_tokens)
         
         # Present approach
         if num_parts == 1:
             print("\nThis summarization task fits within Claude 3.7's context window. No need to split the file.")
         else:
             print(f"\nTo summarize this book, I'll need to split this file into {num_parts} parts")
-            print(f"so it can be summarized by Claude 3.7. I'll include a 5% overlap in each part")
-            print(f"for cohesiveness of the summary.")
+            
+            # Explain the limiting factor
+            if limiting_factor == "input":
+                print(f"The split is necessary because the book is too large ({token_count:,} tokens) for")
+                print(f"Claude's {CLAUDE_MAX_INPUT_TOKENS:,} token input limit.")
+            elif limiting_factor == "output":
+                print(f"The split is necessary because your desired summary length ({desired_output_tokens:,} tokens) exceeds")
+                print(f"Claude's {CLAUDE_MAX_OUTPUT_TOKENS:,} token output limit per request.")
+            
+            print(f"I'll include a 5% overlap in each part for cohesiveness of the summary.")
         
         # Ask user to proceed or modify
         while True:
-            choice = input("Proceed? (yes/no/modify): ").lower()
+            user_input = input("Proceed? (yes/no/modify): ").lower()
+            choice = check_for_exit(user_input)
             
             if choice in ["yes", "y"]:
                 break
@@ -573,7 +885,9 @@ def main():
                 # Allow user to modify parameters
                 while True:
                     try:
-                        num_parts = int(input(f"Enter new number of parts (current: {num_parts}): "))
+                        user_input = input(f"Enter new number of parts (current: {num_parts}): ")
+                        check_for_exit(user_input)
+                        num_parts = int(user_input)
                         if num_parts <= 0:
                             print("Please enter a positive number.")
                             continue
@@ -584,7 +898,9 @@ def main():
                 overlap_percentage = 5  # Default
                 while True:
                     try:
-                        overlap_percentage = float(input("Enter new overlap percentage (current: 5): "))
+                        user_input = input("Enter new overlap percentage (current: 5): ")
+                        check_for_exit(user_input)
+                        overlap_percentage = float(user_input)
                         if overlap_percentage < 0 or overlap_percentage > 50:
                             print("Please enter a number between 0 and 50.")
                             continue
@@ -608,7 +924,8 @@ def main():
         
         # Ask user to proceed
         while True:
-            choice = input("Would you like to proceed? (yes/no): ").lower()
+            user_input = input("Would you like to proceed? (yes/no): ").lower()
+            choice = check_for_exit(user_input)
             
             if choice in ["yes", "y"]:
                 break
@@ -624,52 +941,11 @@ def main():
         
         # Split text
         parts = split_text(text, num_parts)
-    
-    # Check for API key in .env file first
-    load_dotenv()
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    
-    # If API key not found in environment, ask user for it
-    if not api_key:
-        api_key = input("\nPlease enter your Anthropic API key: ")
-    
-    # Basic validation of API key format
-    if not api_key.startswith("sk-ant-"):
-        print("\nWarning: The API key doesn't follow the expected format (should start with 'sk-ant-').")
-        print("This may cause authentication issues.")
         
-        while True:
-            continue_choice = input("Do you still want to continue? (y/n): ").lower()
-            if continue_choice in ['y', 'yes']:
-                break
-            elif continue_choice in ['n', 'no']:
-                print("Exiting.")
-                sys.exit(0)
-            else:
-                print("Please enter 'y' or 'n'.")
+        # Save parts to Temp folder
+        save_text_parts_to_temp(filename, parts)
     
-    # Initialize client with proper API key and base URL
-    try:
-        client = anthropic.Anthropic(api_key=api_key)
-        
-        # Test the API connection with a minimal request
-        print("\nVerifying API connection...")
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=10,
-            messages=[
-                {"role": "user", "content": "Say 'API connection successful' and nothing else."}
-            ]
-        )
-        print(f"API connection verified: {response.content[0].text.strip()}")
-    except Exception as e:
-        print(f"\nError connecting to Claude API: {str(e)}")
-        print("\nPossible issues:")
-        print("1. The API key may be invalid")
-        print("2. You may not have access to the specified model")
-        print("3. There may be network connectivity issues")
-        print("\nPlease check your API key and try again.")
-        sys.exit(1)
+    # Process parts with the client initialized earlier
     
     # Process each part
     print("\nSummarizing text...")
@@ -699,6 +975,7 @@ def main():
             
             # Save progress to temp file
             temp_file = save_to_temp_file(filename, part_num, num_parts, summaries, desired_output_tokens)
+            # Note: temp_file may be None if saving failed, but we can continue anyway
             
             # Show progress
             show_progress(part_num, num_parts, start_time)
@@ -728,14 +1005,44 @@ def main():
     
     # Create BooksOut directory if it doesn't exist
     booksout_dir = Path("BooksOut")
-    booksout_dir.mkdir(exist_ok=True)
+    try:
+        booksout_dir.mkdir(exist_ok=True, mode=0o777)
+        # Try to set permissions if directory already exists
+        try:
+            os.chmod(booksout_dir, 0o777)
+        except:
+            pass  # Ignore if we can't set permissions
+    except Exception as e:
+        print(f"Warning: Could not create or set permissions on BooksOut directory: {str(e)}")
+        print("Will attempt to continue anyway...")
     
     # Prepare file paths
     txt_output = booksout_dir / f"{file_base}_summary.txt"
     
     # Save text file
-    with open(txt_output, 'w', encoding='utf-8') as f:
-        f.write(combined_summary)
+    try:
+        with open(txt_output, 'w', encoding='utf-8') as f:
+            f.write(combined_summary)
+            
+        # Try to set permissions on the output file
+        try:
+            os.chmod(txt_output, 0o666)  # rw-rw-rw-
+        except:
+            pass  # Ignore if we can't set permissions
+            
+        print(f"Summary saved as: {txt_output}")
+    except PermissionError:
+        print(f"Error: Permission denied when writing summary to {txt_output}")
+        # Try to save to the current directory as a fallback
+        fallback_file = Path(f"{file_base}_summary.txt")
+        try:
+            with open(fallback_file, 'w', encoding='utf-8') as f:
+                f.write(combined_summary)
+            print(f"Summary saved to current directory instead: {fallback_file}")
+        except Exception as e:
+            print(f"Error: Could not save summary file at all: {str(e)}")
+    except Exception as e:
+        print(f"Error: Could not save summary file: {str(e)}")
     
     # Move the original file to BooksOut (if it's not already there)
     original_file = Path(filename)
@@ -747,12 +1054,18 @@ def main():
             # Copy the original file rather than move it (safer)
             with open(original_file, 'rb') as src, open(destination_file, 'wb') as dst:
                 dst.write(src.read())
+                
+            # Try to set permissions on the destination file
+            try:
+                os.chmod(destination_file, 0o666)  # rw-rw-rw-
+            except:
+                pass  # Ignore if we can't set permissions
+                
             print(f"Original file copied to: {destination_file}")
         except Exception as e:
             print(f"Warning: Could not copy original file: {str(e)}")
     
     print(f"\nSummarization complete!")
-    print(f"Summary saved as: {txt_output}")
     
     # Optionally create EPUB if pandoc is available
     try:
@@ -761,9 +1074,18 @@ def main():
             ["pandoc", str(txt_output), "-o", str(epub_output), "--metadata", f"title=Summary of {file_base}"],
             check=True, capture_output=True
         )
+        
+        # Try to set permissions on the EPUB file
+        try:
+            os.chmod(epub_output, 0o666)  # rw-rw-rw-
+        except:
+            pass  # Ignore if we can't set permissions
+            
         print(f"EPUB version saved as: {epub_output}")
     except (subprocess.CalledProcessError, FileNotFoundError):
         print("Note: EPUB creation skipped (requires pandoc to be installed)")
+    except Exception as e:
+        print(f"Warning: Could not create EPUB version: {str(e)}")
         
     # Clean up temp files
     cleanup_temp_files(filename)
