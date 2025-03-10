@@ -18,6 +18,11 @@
 [X] At every point in the flow, the user should be able to exit by typing exit. Add that
 [X] Add functionality - when the book is chosen and the app suggests how many splits to make, add logic to indicate whether the splits are limited by the size of the book (input tokens) or the size of the intended summary (output tokens).
 [X] On the very first page, the interface says Time to read: 55.7 hours (3343 minutes). Remove the minutes part that is in brackets and change the structure so the name is <filename>, ~<hours> to read
+[ ] Overcome the rate limiting issue (smaller chunks, spaced out timing?)
+[ ] Make it so you can choose different models with different cost profiles
+[ ] Make the whole experience simpler - very few pieces of information that reach the user (e.g., nothing on tokens)
+[ ] Make it look beautiful
+
 
 *** END, DO NOT DO STEPS BELOW THIS LINE ***
 
